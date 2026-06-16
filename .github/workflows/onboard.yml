@@ -12,9 +12,9 @@ jobs:
       issues: write
     env:
       GH_TOKEN: ${{ secrets.ORG_ADMIN_TOKEN }}
-      ORG: your-org
+      ORG: Trinity-RL
       DEMO_REPO: tmrc-demo
-      TEMPLATE_REPO: your-org/tmrc-submission-template
+      TEMPLATE_REPO: Trinity-RL/tmrc-submission-template
     steps:
       - uses: actions/checkout@v4
 
