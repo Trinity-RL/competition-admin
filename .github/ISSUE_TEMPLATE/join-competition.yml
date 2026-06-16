@@ -1,0 +1,13 @@
+name: Join the competition
+description: Request access to the demo repo and get your own private submission repo
+title: "[join] "
+labels: ["join-request"]
+body:
+  - type: input
+    id: github_username
+    attributes:
+      label: GitHub username
+      description: Your GitHub username (not your email)
+      placeholder: octocat
+    validations:
+      required: true

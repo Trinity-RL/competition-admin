@@ -1,0 +1,49 @@
+name: Onboard competitor
+
+on:
+  issues:
+    types: [opened]
+
+jobs:
+  onboard:
+    if: contains(github.event.issue.labels.*.name, 'join-request')
+    runs-on: ubuntu-latest
+    permissions:
+      issues: write
+    env:
+      GH_TOKEN: ${{ secrets.ORG_ADMIN_TOKEN }}
+      ORG: your-org
+      DEMO_REPO: tmrc-demo
+      TEMPLATE_REPO: your-org/tmrc-submission-template
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Extract GitHub username from issue body
+        id: extract
+        env:
+          BODY: ${{ github.event.issue.body }}
+        run: |
+          USERNAME=$(printf '%s\n' "$BODY" | awk '/### GitHub username/{getline; getline; gsub(/^[ \t\r]+|[ \t\r]+$/,""); print; exit}')
+          USERNAME="${USERNAME#@}"
+          if [[ ! "$USERNAME" =~ ^[A-Za-z0-9-]{1,39}$ ]]; then
+            echo "Could not parse a valid GitHub username from the issue body" >&2
+            exit 1
+          fi
+          echo "username=$USERNAME" >> "$GITHUB_OUTPUT"
+
+      - name: Run onboarding script
+        id: run
+        run: bash scripts/onboard.sh "${{ steps.extract.outputs.username }}"
+
+      - name: Comment and close issue on success
+        if: success()
+        run: |
+          gh issue comment "${{ github.event.issue.number }}" --repo "${{ github.repository }}" \
+            --body "Welcome! You now have read access to the demo repo and your own private submission repo: https://github.com/${ORG}/submission-${{ steps.extract.outputs.username }}"
+          gh issue close "${{ github.event.issue.number }}" --repo "${{ github.repository }}"
+
+      - name: Comment on failure
+        if: failure()
+        run: |
+          gh issue comment "${{ github.event.issue.number }}" --repo "${{ github.repository }}" \
+            --body "Something went wrong setting up your access. An organizer will follow up shortly."
