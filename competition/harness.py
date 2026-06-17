@@ -153,12 +153,15 @@ def start_tmnf():
         exe = TMNF_DIR / 'TmForever.exe'
     log = open('/tmp/tmnf.log', 'w')
 
+    # Use vglrun for GPU-accelerated rendering if available, otherwise plain wine
+    import shutil
+    cmd = (['vglrun', 'wine', str(exe)] if shutil.which('vglrun')
+           else ['wine', str(exe)])
+    print(f"Launching: {' '.join(cmd)}")
+
     def _run():
         try:
-            proc = subprocess.Popen(
-                ['vglrun', 'wine', str(exe)],
-                stdout=log, stderr=log, cwd=str(exe.parent),
-            )
+            proc = subprocess.Popen(cmd, stdout=log, stderr=log, cwd=str(exe.parent))
             proc.wait()
         except Exception as e:
             print(f"TMNF launch error: {e}")
