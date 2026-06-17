@@ -36,4 +36,20 @@ fi
 # 3. Push access to their own submission repo only.
 gh api -X PUT "repos/${ORG}/${SUBMISSION_REPO}/collaborators/${USERNAME}" -f permission=push
 
+# 4. Grant the submission repo access to the org-level COMPETITION_DISPATCH_TOKEN secret
+#    so their compete.yml can trigger evaluation on competition-admin.
+REPO_ID=$(gh api "repos/${ORG}/${SUBMISSION_REPO}" --jq '.id')
+EXISTING_IDS=$(gh api "orgs/${ORG}/actions/secrets/COMPETITION_DISPATCH_TOKEN/repositories" \
+  --jq '[.repositories[].id]' 2>/dev/null || echo "[]")
+UPDATED_IDS=$(echo "$EXISTING_IDS" | python3 -c "
+import json, sys
+ids = json.load(sys.stdin)
+new_id = int('${REPO_ID}')
+if new_id not in ids:
+    ids.append(new_id)
+print(json.dumps(ids))
+")
+gh api -X PUT "orgs/${ORG}/actions/secrets/COMPETITION_DISPATCH_TOKEN/repositories" \
+  --input <(echo "{\"selected_repository_ids\": ${UPDATED_IDS}}")
+
 echo "submission_repo_url=https://github.com/${ORG}/${SUBMISSION_REPO}"

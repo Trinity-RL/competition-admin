@@ -1,0 +1,75 @@
+name: Evaluate submission
+
+on:
+  repository_dispatch:
+    types: [evaluate-submission]
+
+jobs:
+  evaluate:
+    runs-on: [self-hosted, tmnf]  # self-hosted runner with Docker + cached base image
+    # Fallback for GitHub-hosted runners: replace above with:
+    #   runs-on: ubuntu-latest
+    timeout-minutes: 60
+
+    steps:
+      - name: Check out competition-admin
+        uses: actions/checkout@v4
+
+      - name: Generate run UUID
+        id: uuid
+        run: echo "uuid=$(python3 -c 'import uuid; print(uuid.uuid4())')" >> "$GITHUB_OUTPUT"
+
+      - name: Clone submission repo at triggering commit
+        run: |
+          git clone \
+            "https://x-access-token:${{ secrets.ORG_ADMIN_TOKEN }}@github.com/${{ github.event.client_payload.repository }}.git" \
+            submission
+          cd submission
+          git checkout "${{ github.event.client_payload.commit }}"
+
+      - name: Build participant Docker image
+        run: docker build -t "submission-${{ steps.uuid.outputs.uuid }}" submission/
+
+      - name: Run competition harness
+        run: |
+          mkdir -p results
+          MAPS=$(python3 -c "
+          import yaml, json, sys
+          print(json.dumps(yaml.safe_load(open('maps.yml'))['maps']))
+          ")
+          docker run --rm \
+            -v "$(pwd)/competition/harness.py:/competition/harness.py:ro" \
+            -v "$(pwd)/maps:/competition/maps:ro" \
+            -v "$(pwd)/results:/results" \
+            -e COMPETITION_MAPS="$MAPS" \
+            -e PARTICIPANT="${{ github.event.client_payload.participant }}" \
+            -e RUN_UUID="${{ steps.uuid.outputs.uuid }}" \
+            -e REPOSITORY="${{ github.event.client_payload.repository }}" \
+            -e COMMIT_SHA="${{ github.event.client_payload.commit }}" \
+            --entrypoint python3 \
+            "submission-${{ steps.uuid.outputs.uuid }}" \
+            /competition/harness.py
+
+      - name: Commit run files and rebuild leaderboard
+        run: |
+          git clone \
+            "https://x-access-token:${{ secrets.ORG_ADMIN_TOKEN }}@github.com/Trinity-RL/.github-private.git" \
+            leaderboard
+          mkdir -p leaderboard/runs
+          # Copy UUID-named JSON and replay files
+          cp results/${{ steps.uuid.outputs.uuid }}* leaderboard/runs/ 2>/dev/null || true
+          # Rebuild README leaderboard section
+          python3 competition/generate_leaderboard.py \
+            leaderboard/runs/ \
+            leaderboard/profile/README.md
+          cd leaderboard
+          git config user.name "TMRC Bot"
+          git config user.email "bot@trinity-rl.org"
+          git add runs/ profile/README.md
+          git diff --cached --quiet && echo "Nothing to commit" && exit 0
+          git commit -m "Run ${{ steps.uuid.outputs.uuid }}: ${{ github.event.client_payload.participant }} @ ${{ github.event.client_payload.commit }}"
+          git push
+
+      - name: Clean up Docker image
+        if: always()
+        run: docker rmi "submission-${{ steps.uuid.outputs.uuid }}" 2>/dev/null || true

@@ -1,0 +1,10 @@
+maps:
+  - id: map1
+    name: "White A01-Race"
+    file: "A01-Race.Challenge.Gbx"
+  - id: map2
+    name: "White A02-Race"
+    file: "A02-Race.Challenge.Gbx"
+  - id: map3
+    name: "White A03-Race"
+    file: "A03-Race.Challenge.Gbx"
