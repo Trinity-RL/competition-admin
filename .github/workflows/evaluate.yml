@@ -27,6 +27,13 @@ jobs:
           cd submission
           git checkout "${{ github.event.client_payload.commit }}"
 
+      - name: Fetch track data
+        # Wall/centre-line data for wall_distances, the same data the TMRC
+        # framework uses. Recorded in the log so a result can be traced back.
+        run: |
+          git clone --depth 1 https://github.com/Trinity-RL/Tracks.git tracks
+          echo "Tracks commit: $(git -C tracks rev-parse HEAD)"
+
       - name: Build participant Docker image
         run: docker build -t "submission-${{ steps.uuid.outputs.uuid }}" submission/
 
@@ -40,12 +47,14 @@ jobs:
           docker run --rm \
             -v "$(pwd)/competition/harness.py:/competition/harness.py:ro" \
             -v "$(pwd)/maps:/competition/maps:ro" \
+            -v "$(pwd)/tracks:/competition/tracks:ro" \
             -v "$(pwd)/results:/results" \
             -e COMPETITION_MAPS="$MAPS" \
             -e PARTICIPANT="${{ github.event.client_payload.participant }}" \
             -e RUN_UUID="${{ steps.uuid.outputs.uuid }}" \
             -e REPOSITORY="${{ github.event.client_payload.repository }}" \
             -e COMMIT_SHA="${{ github.event.client_payload.commit }}" \
+            -e TM_STEP_MS=50 \
             --entrypoint python3 \
             "submission-${{ steps.uuid.outputs.uuid }}" \
             /competition/harness.py

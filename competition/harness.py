@@ -9,14 +9,25 @@ Replaces entrypoint.sh entirely: starts Xvfb, launches the game,
 connects to TMInterface, and drives the race loop on each competition map.
 Calls decide() from the participant's agent.py each simulation step.
 
+Agent interface (the same as the TMRC framework's, github.com/ZSH4RK/TMRC):
+  decide(game_state, wall_distances) -> {left, right, accelerate, brake}
+    game_state:     {"position", "velocity", "direction"} (3-tuples)
+    wall_distances: 7 (distance_m or None, "left"/"right"/None) pairs at
+                    RAY_ANGLES, computed from Trinity-RL/Tracks data; all
+                    (None, None) on maps without track data
+  Agents written for the original decide(race_time_ms, state) interface are
+  detected by their first parameter's name and still called that way.
+
 Environment variables (set by evaluate.yml):
   COMPETITION_MAPS   JSON array: [{id, name, file}, ...]
   PARTICIPANT        GitHub username
   RUN_UUID           UUID for this evaluation run
   REPOSITORY         GitHub repo (org/submission-username)
   COMMIT_SHA         Git commit that triggered this run
+  TM_STEP_MS         Game time between decide() calls (default 50, as in TMRC)
 """
 
+import inspect
 import json
 import os
 import shutil
@@ -42,6 +53,16 @@ REPOSITORY = os.environ.get('REPOSITORY', '')
 COMMIT_SHA = os.environ.get('COMMIT_SHA', '')
 
 PORT = 8775
+# Game time between decide() calls. Must match the TMRC framework's default,
+# because agents trained there act at that rate and drive differently at others.
+STEP_MS = int(os.environ.get('TM_STEP_MS', '50'))
+# Same angles, order and maths as TMRC's track_features.RAY_ANGLES.
+RAY_ANGLES = [-90, -45, -10, 0, 10, 45, 90]
+# Trinity-RL/Tracks: mounted by evaluate.yml; images built from the current
+# template also carry a copy at /opt/tracks.
+TRACKS_DIRS = [Path('/competition/tracks'), Path('/opt/tracks')]
+# decide() errors printed per map; all are counted in the results.
+MAX_PRINTED_ERRORS = 5
 MAP_TIMEOUT_SECONDS = 300  # 5 min per map
 MAP_LOAD_WAIT = 6          # seconds to wait after execute_command('map ...')
 POST_RUN_DRAIN = 3         # seconds to drain socket after each map
@@ -109,8 +130,12 @@ def sock_set_input(sock, left=False, right=False, accelerate=False, brake=False)
     ))
 
 
-def sock_get_sim_state(sock):
-    """Fetch position + velocity from the running simulation."""
+def sock_set_step_period(sock, period_ms: int):
+    sock.sendall(struct.pack("ii", int(MessageType.C_SET_ON_STEP_PERIOD), int(period_ms)))
+
+
+def sock_get_raw_state(sock):
+    """Fetch the full simulation state."""
     import numpy as np
     from tminterface.structs import CheckpointData, SimStateData
     sock.sendall(struct.pack("i", int(MessageType.C_GET_SIMULATION_STATE)))
@@ -119,10 +144,68 @@ def sock_get_sim_state(sock):
     state = SimStateData(raw)
     state.cp_data.resize(CheckpointData.cp_states_field, state.cp_data.cp_states_length)
     state.cp_data.resize(CheckpointData.cp_times_field, state.cp_data.cp_times_length)
+    return state
+
+
+def sock_get_sim_state(sock):
+    """Fetch position, velocity and facing direction, as the TMRC framework reads them."""
+    state = sock_get_raw_state(sock)
+    rot = state.rotation_matrix  # columns are the car's local axes; the third is forward
     return {
         "position": (float(state.position[0]), float(state.position[1]), float(state.position[2])),
         "velocity": (float(state.velocity[0]), float(state.velocity[1]), float(state.velocity[2])),
+        "direction": (float(rot[0][2]), float(rot[1][2]), float(rot[2][2])),
     }
+
+
+# ---------------------------------------------------------------------------
+# Agent interface
+# ---------------------------------------------------------------------------
+class WallSensor:
+    """Wall distances along RAY_ANGLES for one map, computed with Tracks'
+    interpolate_track.TrackInterpolator exactly as the TMRC framework does."""
+
+    def __init__(self, map_name: str):
+        self.map_name = map_name
+        self.track, self.Vec3, self.source = None, None, None
+        for tracks_dir in TRACKS_DIRS:
+            csv = tracks_dir / map_name / 'points-offset.csv'
+            if not csv.exists():
+                continue
+            try:
+                if str(tracks_dir) not in sys.path:
+                    sys.path.insert(0, str(tracks_dir))
+                from interpolate_track import TrackInterpolator, Vec3
+                self.track, self.Vec3, self.source = TrackInterpolator(csv_path=csv), Vec3, str(csv)
+                print(f"  Track data: {csv}")
+            except Exception as e:
+                print(f"  WARNING: could not load track data {csv}: {e}")
+            break
+        if self.track is None:
+            print(f"  No track data for {map_name}: wall_distances will all be (None, None)")
+
+    def __call__(self, game_state):
+        if self.track is None:
+            return [(None, None)] * len(RAY_ANGLES)
+        return self.track.cast_rays(self.Vec3(*game_state["position"]),
+                                    self.Vec3(*game_state["direction"]), RAY_ANGLES)
+
+
+def make_driver(decide):
+    """Wrap decide() as driver(race_time_ms, game_state, wall_distances) -> action.
+
+    Returns (interface name, driver, default for a missing key). The original
+    interface is recognised by its first parameter, race_time_ms."""
+    try:
+        params = list(inspect.signature(decide).parameters)
+    except (TypeError, ValueError):
+        params = []
+    if params and params[0].startswith('race_time'):
+        def legacy(race_time_ms, game_state, _walls):
+            return decide(race_time_ms, {"position": game_state["position"], "velocity": game_state["velocity"]})
+        # The original harness treated a missing "accelerate" as pressed.
+        return 'legacy', legacy, True
+    return 'tmrc', (lambda _race_time_ms, game_state, walls: decide(game_state, walls)), False
 
 
 # ---------------------------------------------------------------------------
@@ -215,11 +298,13 @@ def drain_socket(sock, duration: float):
 # ---------------------------------------------------------------------------
 # Per-map run
 # ---------------------------------------------------------------------------
-def run_map(sock, map_info: dict, decide_fn) -> dict:
+def run_map(sock, map_info: dict, driver, accelerate_default: bool) -> dict:
     map_id = map_info['id']
     map_file = map_info['file']
 
     print(f"\n=== {map_info['name']} ({map_file}) ===")
+    sensor = WallSensor(map_info.get('track', map_file.replace('.Challenge.Gbx', '')))
+    decide_errors = 0
 
     REPLAYS_DIR.mkdir(parents=True, exist_ok=True)
     before_replays = set(REPLAYS_DIR.glob('*.Replay.Gbx'))
@@ -251,17 +336,22 @@ def run_map(sock, map_info: dict, decide_fn) -> dict:
             last_race_time = recv_int32(sock)
 
             try:
-                state = sock_get_sim_state(sock)
-                action = decide_fn(last_race_time, state)
+                game_state = sock_get_sim_state(sock)
+                action = driver(last_race_time, game_state, sensor(game_state))
+                if not isinstance(action, dict):
+                    raise TypeError(f"decide() returned {type(action).__name__}, expected dict")
+                accelerate = action.get("accelerate", accelerate_default)
             except Exception as e:
-                print(f"  decide() error: {e} — defaulting to accelerate")
-                action = {}
+                decide_errors += 1
+                if decide_errors <= MAX_PRINTED_ERRORS:
+                    print(f"  decide() error at {last_race_time} ms: {type(e).__name__}: {e} — accelerating this step")
+                action, accelerate = {}, True
 
             sock_set_input(
                 sock,
                 left=bool(action.get("left", False)),
                 right=bool(action.get("right", False)),
-                accelerate=bool(action.get("accelerate", True)),
+                accelerate=bool(accelerate),
                 brake=bool(action.get("brake", False)),
             )
             send_int32(sock, MessageType.SC_RUN_STEP_SYNC)
@@ -271,13 +361,21 @@ def run_map(sock, map_info: dict, decide_fn) -> dict:
             target = recv_int32(sock)
             checkpoints_passed = current
             total_checkpoints = target
-            final_checkpoint_time_ms = last_race_time
-            print(f"  CP {current}/{target} at {last_race_time} ms")
+            # The exact time from the game: last_race_time is the latest decision
+            # step, up to STEP_MS - 10 ms before the checkpoint was crossed.
+            # Read before acking, while the game is paused on this message.
+            try:
+                cp_time_ms = int(sock_get_raw_state(sock).race_time)
+            except Exception as e:
+                print(f"  Could not read exact checkpoint time ({e}); using {last_race_time} ms")
+                cp_time_ms = last_race_time
+            final_checkpoint_time_ms = cp_time_ms
+            print(f"  CP {current}/{target} at {cp_time_ms} ms")
             send_int32(sock, MessageType.SC_CHECKPOINT_COUNT_CHANGED_SYNC)
 
             if current == target:
                 finished = True
-                race_time_ms = last_race_time
+                race_time_ms = cp_time_ms
                 print(f"  FINISHED: {race_time_ms} ms")
                 # Give up triggers automatic replay save
                 send_int32(sock, MessageType.C_GIVE_UP)
@@ -316,6 +414,8 @@ def run_map(sock, map_info: dict, decide_fn) -> dict:
         "total_checkpoints": total_checkpoints,
         "final_checkpoint_time_ms": final_checkpoint_time_ms,
         "replay_file": replay_filename,
+        "track_data": sensor.source is not None,
+        "decide_errors": decide_errors,
     }
 
 
@@ -335,6 +435,8 @@ def main():
     except Exception as e:
         print(f"FATAL: could not import decide() from agent.py: {e}")
         sys.exit(1)
+    interface, driver, accelerate_default = make_driver(decide)
+    print(f"Agent interface: {interface}, decide() every {STEP_MS} ms")
 
     stage_maps()
     start_xvfb()
@@ -349,11 +451,12 @@ def main():
 
     # Pre-send SC_ON_CONNECT_SYNC — prevents the 2 s timeout in the plugin
     send_int32(sock, MessageType.SC_ON_CONNECT_SYNC)
+    sock_set_step_period(sock, STEP_MS)
     print("Connected")
 
     map_results = []
     for map_info in MAPS:
-        result = run_map(sock, map_info, decide)
+        result = run_map(sock, map_info, driver, accelerate_default)
         map_results.append(result)
 
     send_int32(sock, MessageType.C_SHUTDOWN)
@@ -365,6 +468,8 @@ def main():
         "repository": REPOSITORY,
         "commit": COMMIT_SHA,
         "submitted_at": datetime.now(timezone.utc).isoformat(),
+        "interface": interface,
+        "step_ms": STEP_MS,
         "maps": map_results,
     }
     out_path = RESULTS_DIR / f"{RUN_UUID}.json"
