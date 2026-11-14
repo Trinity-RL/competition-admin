@@ -22,6 +22,8 @@ Rules (keep TMRC/docs/11-competition.md in sync):
     that step and the error is counted
   - agent.py is imported fresh for each map, with TM_MAP_NAME set to that map,
     so module-level state starts clean and track_features.py loads the right map
+  - agents written for the original decide(race_time_ms, state) interface are
+    recognised by their first parameter's name and still called that way
 
 Environment variables (set by evaluate.yml):
   COMPETITION_MAPS   JSON array: [{id, name, file}, ...]
@@ -39,6 +41,7 @@ Optional:
 
 import csv
 import importlib.util
+import inspect
 import json
 import os
 import shutil
@@ -261,13 +264,33 @@ def load_agent(map_name: str):
     spec.loader.exec_module(module)
     if not callable(getattr(module, 'decide', None)):
         raise AttributeError('agent.py has no decide(game_state, wall_distances) function')
-    return module.decide
+    return make_driver(module.decide)
 
 
-def clean_inputs(action) -> dict:
+def make_driver(decide):
+    """Wrap decide() as driver(race_time_ms, game_state, wall_distances).
+    Returns (interface, driver, default for a missing input key).
+
+    Agents written for the original interface, decide(race_time_ms, state)
+    with state = {position, velocity} and accelerate on unless returned False,
+    are recognised by their first parameter's name and still run that way."""
+    try:
+        params = list(inspect.signature(decide).parameters)
+    except (TypeError, ValueError):
+        params = []
+    if params and params[0].startswith('race_time'):
+        def legacy(race_time_ms, game_state, _walls):
+            return decide(race_time_ms, {'position': game_state['position'],
+                                         'velocity': game_state['velocity']})
+        return 'legacy', legacy, True
+    return 'tmrc', (lambda _race_time_ms, game_state, walls: decide(game_state, walls)), False
+
+
+def clean_inputs(action, accelerate_default: bool = False) -> dict:
     if not isinstance(action, dict):
         raise TypeError(f'decide() returned {type(action).__name__}, expected a dict')
-    return {key: bool(action.get(key, False)) for key in INPUT_KEYS}
+    return {key: bool(action.get(key, accelerate_default and key == 'accelerate'))
+            for key in INPUT_KEYS}
 
 
 # ---------------------------------------------------------------------------
@@ -417,18 +440,21 @@ def run_map(game: Game, map_info: dict, first: bool) -> dict:
         'finished': False, 'race_time_ms': None, 'end_reason': None,
         'checkpoints_passed': 0, 'total_checkpoints': 0, 'final_checkpoint_time_ms': None,
         'distance_m': None, 'track_length_m': None, 'track_pct': None,
-        'steps': 0, 'decide_errors': 0, 'first_error': None,
+        'interface': None, 'steps': 0, 'decide_errors': 0, 'first_error': None,
         'decide_ms_mean': None, 'decide_ms_max': None, 'replay_file': None,
     }
 
     track = Track(map_name)
     if track.length_m:
         result['track_length_m'] = round(track.length_m, 1)
+    driver, accelerate_default = None, False
     try:
-        decide = load_agent(map_name)
+        interface, driver, accelerate_default = load_agent(map_name)
+        result['interface'] = interface
+        if interface == 'legacy':
+            print('  agent.py uses the original decide(race_time_ms, state) interface')
     except Exception:
         # Can't even import: every step counts as an error, so the car accelerates.
-        decide = None
         result['first_error'] = 'loading agent.py: ' + traceback.format_exc(limit=3)
         print(f"  {result['first_error']}")
 
@@ -465,9 +491,9 @@ def run_map(game: Game, map_info: dict, first: bool) -> dict:
         wall_distances = track.rays(game_state['position'], game_state['direction'])
         started = time.perf_counter()
         try:
-            if decide is None:
+            if driver is None:
                 raise RuntimeError('agent.py did not load')
-            inputs = clean_inputs(decide(game_state, wall_distances))
+            inputs = clean_inputs(driver(race_time, game_state, wall_distances), accelerate_default)
         except Exception:
             inputs = dict(ERROR_INPUTS)
             result['decide_errors'] += 1

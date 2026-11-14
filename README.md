@@ -13,3 +13,25 @@
 7. Clone your submission repo and start building your bot against the interface in `tmrc-demo`.
 
 If something goes wrong, the bot will comment on your issue explaining the failure instead of closing it — an organizer will follow up.
+
+## How submissions are run
+
+`competition/harness.py` imports `decide()` from your `agent/agent.py` and calls it every
+50 ms of game time on each map in `maps.yml`, with the same inputs as the
+[TMRC framework](https://github.com/ZSH4RK/TMRC):
+
+```python
+def decide(game_state, wall_distances):  # -> {"left", "right", "accelerate", "brake"}
+```
+
+- Each map is one attempt, limited to 5 minutes of game time. Finishers are ranked by time,
+  everyone else by distance along the track.
+- `agent.py` is imported fresh for each map, with `TM_MAP_NAME` set to that map.
+- If `decide()` raises an error or returns something unusable, the car accelerates for that
+  step and the error is counted in your results.
+- `wall_distances` comes from the [Tracks](https://github.com/Trinity-RL/Tracks) data for
+  A01, A02 and A03. The copy used is in `tracks/`, and `tracks/SOURCE` names the Tracks
+  commit it came from.
+- Bots written for the original `decide(race_time_ms, state)` interface still run.
+
+Full rules: TMRC's `docs/11-competition.md`.
