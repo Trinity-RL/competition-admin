@@ -37,9 +37,13 @@ jobs:
           import yaml, json, sys
           print(json.dumps(yaml.safe_load(open('maps.yml'))['maps']))
           ")
+          # maps/ is optional: campaign maps are copied from the game itself.
+          MAPS_MOUNT=()
+          [ -d maps ] && MAPS_MOUNT=(-v "$(pwd)/maps:/competition/maps:ro")
           docker run --rm \
             -v "$(pwd)/competition/harness.py:/competition/harness.py:ro" \
-            -v "$(pwd)/maps:/competition/maps:ro" \
+            -v "$(pwd)/tracks:/competition/tracks:ro" \
+            "${MAPS_MOUNT[@]}" \
             -v "$(pwd)/results:/results" \
             -e COMPETITION_MAPS="$MAPS" \
             -e PARTICIPANT="${{ github.event.client_payload.participant }}" \
