@@ -8,7 +8,10 @@ Usage:
 Reads all *.json files in runs_dir.
 For each participant, keeps their best run per map:
   - Finished runs: lowest race_time_ms wins
-  - DNF runs: highest checkpoints_passed (used only if no finished run exists)
+  - DNF runs: furthest distance_m along the track (checkpoints_passed for
+    runs recorded before distance existed), used only if no finished run exists
+This is the same race ranking the TMRC framework uses: finishes by time, then
+non-finishes by how far they got.
 Writes the leaderboard between <!-- LEADERBOARD_START --> and <!-- LEADERBOARD_END -->
 markers in the README, preserving everything outside those markers.
 """
@@ -32,6 +35,13 @@ def format_time(ms: int | None) -> str:
     return f"{minutes}:{seconds:06.3f}"
 
 
+def format_distance(result: dict) -> str:
+    if result.get("distance_m") is None:
+        return "—"
+    pct = result.get("track_pct")
+    return f"{result['distance_m']:.0f} m" + (f" ({pct:.0f}%)" if pct is not None else "")
+
+
 def load_runs(runs_dir: Path) -> list[dict]:
     runs = []
     for path in sorted(runs_dir.glob("*.json")):
@@ -42,10 +52,16 @@ def load_runs(runs_dir: Path) -> list[dict]:
     return runs
 
 
+def dnf_key(result: dict) -> tuple:
+    """How far a non-finishing run got: distance first, checkpoints as a tiebreak
+    (and the only measure for runs recorded before distance existed)."""
+    return (result.get("distance_m") or 0.0, result.get("checkpoints_passed") or 0)
+
+
 def best_runs_per_participant(runs: list[dict]) -> dict:
     """
     Returns {participant: {map_id: best_result_dict}}.
-    Best = finished run with lowest race_time_ms, else DNF with most checkpoints.
+    Best = finished run with lowest race_time_ms, else DNF that got furthest.
     """
     best: dict[str, dict[str, dict]] = {}
     for run in runs:
@@ -59,7 +75,7 @@ def best_runs_per_participant(runs: list[dict]) -> dict:
                 best[participant][map_id] = map_result
                 continue
 
-            # Finished beats DNF; among finishers lowest time wins; among DNFs most CPs win
+            # Finished beats DNF; among finishers lowest time wins; among DNFs furthest wins
             cur_finished = map_result.get("finished", False)
             prev_finished = prev.get("finished", False)
 
@@ -69,7 +85,7 @@ def best_runs_per_participant(runs: list[dict]) -> dict:
                 if (map_result["race_time_ms"] or 0) < (prev["race_time_ms"] or 0):
                     best[participant][map_id] = map_result
             elif not cur_finished and not prev_finished:
-                if (map_result["checkpoints_passed"] or 0) > (prev["checkpoints_passed"] or 0):
+                if dnf_key(map_result) > dnf_key(prev):
                     best[participant][map_id] = map_result
 
     return best
@@ -86,7 +102,7 @@ def map_order(runs: list[dict]) -> list[tuple[str, str]]:
 
 
 def rank_participants(best: dict, map_id: str) -> list[tuple[str, dict]]:
-    """Return participants sorted: finishers by time asc, then DNF by checkpoints desc."""
+    """Return participants sorted: finishers by time asc, then DNF by distance desc."""
     rows = [
         (participant, result)
         for participant, maps in best.items()
@@ -98,7 +114,8 @@ def rank_participants(best: dict, map_id: str) -> list[tuple[str, dict]]:
     )
     dnf = sorted(
         [(p, r) for p, r in rows if not r.get("finished")],
-        key=lambda x: -(x[1]["checkpoints_passed"] or 0),
+        key=lambda x: dnf_key(x[1]),
+        reverse=True,
     )
     return finishers + dnf
 
@@ -114,12 +131,12 @@ def build_leaderboard(runs: list[dict]) -> str:
 
     for map_id, map_name in maps:
         lines.append(f"\n## {map_name}\n")
-        lines.append("| Rank | Participant | Time | Checkpoints | Last CP Time |")
-        lines.append("|------|-------------|------|-------------|--------------|")
+        lines.append("| Rank | Participant | Time | Distance | Checkpoints | Last CP Time |")
+        lines.append("|------|-------------|------|----------|-------------|--------------|")
 
         ranked = rank_participants(best, map_id)
         if not ranked:
-            lines.append("| — | *No submissions yet* | — | — | — |")
+            lines.append("| — | *No submissions yet* | — | — | — | — |")
             continue
 
         for rank, (participant, result) in enumerate(ranked, start=1):
@@ -130,6 +147,7 @@ def build_leaderboard(runs: list[dict]) -> str:
                 f"| {rank} "
                 f"| [{participant}](https://github.com/{participant}) "
                 f"| {format_time(result.get('race_time_ms'))} "
+                f"| {format_distance(result)} "
                 f"| {cp_str} "
                 f"| {format_time(result.get('final_checkpoint_time_ms'))} |"
             )
